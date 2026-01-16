@@ -1,0 +1,123 @@
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import smtplib
+import webbrowser
+import os
+from email.message import EmailMessage
+
+# --- CLOUD DATA CONFIGURATION ---
+def load_cloud_data():
+    """Connects to Google Sheets and pulls the live portfolio."""
+    try:
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        # This uses the JSON file you just moved
+        creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
+        client = gspread.authorize(creds)
+        # Matches the name of your sheet
+        sheet = client.open("Heritage_Harvest_Pricing").sheet1
+        return sheet.get_all_records()
+    except Exception as e:
+        print(f"❌ Cloud Connection Error: {e}")
+        return None
+
+def find_best_sku_match(customer_input, data):
+    search_term = customer_input.lower()
+    for row in data:
+        if search_term in str(row['product_name']).lower():
+            return row
+    return None
+
+def audit_negotiation(requested_product, requested_discount, portfolio_data):
+    sku_data = find_best_sku_match(requested_product, portfolio_data)
+    if not sku_data: return {"status": "ERROR", "matched_sku": requested_product}
+    
+    lp, cogs = float(sku_data['list_price']), float(sku_data['cogs'])
+    min_margin = float(sku_data['min_margin_threshold'])
+    max_discount = float(sku_data['max_allowable_discount'])
+    
+    net_price = lp * (1 - requested_discount)
+    actual_margin = (net_price - cogs) / net_price
+    
+    res = {
+        "sku_id": sku_data['sku_id'],
+        "upc": sku_data['upc'],
+        "matched_sku": sku_data['product_name'],
+        "actual_margin": f"{actual_margin:.1%}"
+    }
+
+    if actual_margin >= min_margin and requested_discount <= max_discount:
+        res["status"] = "APPROVED"
+        res["margin_achieved"] = f"{actual_margin:.1%}"
+    else:
+        res["status"] = "DENIED"
+    return res
+
+def send_summary_email(summary_list):
+    SENDER_EMAIL = "jbconsultingdemo@gmail.com" 
+    APP_PASSWORD = "hryfpqvirwvx jkhc"
+    RECEIVER_EMAIL = "jbridges@jbridgesconsulting.com"
+
+    msg = EmailMessage()
+    msg['Subject'] = "✔️ Trade Approval: Heritage Harvest Portfolio Cleared for Planning"
+    msg['From'] = f"Jenica Bridges <{SENDER_EMAIL}>"
+    msg['To'] = f"John Bridges <{RECEIVER_EMAIL}>"
+
+    body = (
+        f"Hi John,\n\n"
+        f"The requested trade scenarios for the Heritage Harvest snacks portfolio have been approved:\n\n"
+        f"{summary_list}\n\n"
+        f"You may proceed with retailer planning. Thank you for your partnership.\n\n"
+        f"Best regards,\nJenica Bridges"
+    )
+    msg.set_content(body, charset='utf-8')
+
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587) as smtp:
+            smtp.starttls()
+            smtp.login(SENDER_EMAIL, APP_PASSWORD.replace(" ", ""))
+            smtp.send_message(msg)
+        print(f"📧 SUCCESS: Cloud summary email sent to {RECEIVER_EMAIL}!")
+    except Exception as e:
+        print(f"❌ Email failed: {e}")
+
+def generate_ux_dashboard(audit_results):
+    html_file = "dashboard.html"
+    html_content = f"""<html><head><style>
+        body {{ font-family: sans-serif; margin: 40px; background: #f8f9fa; }}
+        .card {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ padding: 12px; border-bottom: 1px solid #eee; text-align: left; }}
+        th {{ background: #2c3e50; color: white; }}
+        .APPROVED {{ color: #27ae60; font-weight: bold; }}
+        .DENIED {{ color: #e74c3c; font-weight: bold; }}
+    </style></head><body><div class="card">
+    <h1>📊 Heritage Harvest - Cloud Audit Dashboard</h1>
+    <table><tr><th>SKU ID</th><th>UPC</th><th>Product Name</th><th>Status</th><th>Margin</th></tr>"""
+    
+    for res in audit_results:
+        s = res['status']
+        m = res.get('margin_achieved') or res.get('actual_margin')
+        html_content += f"<tr><td>{res['sku_id']}</td><td>{res['upc']}</td><td>{res['matched_sku']}</td><td class='{s}'>{s}</td><td>{m}</td></tr>"
+    
+    html_content += "</table></div></body></html>"
+    with open(html_file, "w", encoding='utf-8') as f: f.write(html_content)
+    webbrowser.open('file://' + os.path.realpath(html_file))
+
+if __name__ == "__main__":
+    print("\n🚀 CONNECTING TO HERITAGE HARVEST CLOUD...")
+    portfolio = load_cloud_data()
+    
+    if portfolio:
+        results = []
+        approved_text = []
+        for row in portfolio:
+            res = audit_negotiation(row['product_name'], 0.15, portfolio)
+            results.append(res)
+            print(f"Auditing: {res['matched_sku']}... {res['status']}")
+            if res['status'] == "APPROVED":
+                approved_text.append(f"- SKU {res['sku_id']} | {res['matched_sku']} (UPC: {res['upc']}) | Margin: {res['margin_achieved']}")
+
+        if approved_text:
+            send_summary_email("\n".join(approved_text))
+        
+        generate_ux_dashboard(results)
