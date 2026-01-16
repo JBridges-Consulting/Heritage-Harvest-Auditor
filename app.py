@@ -1,63 +1,80 @@
 import streamlit as st
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from rapidfuzz import process, fuzz
 
-# 1. PAGE CONFIG (Branding)
-st.set_page_config(page_title="Heritage Harvest Sales Portal", page_icon="🥔")
+# --- JBridges Consulting | Brand Header ---
+st.set_page_config(page_title="Heritage Harvest | Audit Portal", page_icon="📊")
+st.title("JBridges Consulting | Heritage Harvest 📊")
+st.markdown("### Automated Sales & Trade Audit Portal")
 
-# 2. CONNECT TO CLOUD DATA
-def get_data():
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("service_account.json", scope)
-    client = gspread.authorize(creds)
-    sheet = client.open("Heritage_Harvest_Pricing").sheet1
-    return pd.DataFrame(sheet.get_all_records())
+# --- 1. SECURE AUTHENTICATION (The Cloud Bridge) ---
+@st.cache_resource
+def get_gspread_client():
+    # Fetch credentials from Streamlit Cloud Secrets (NOT a local file)
+    try:
+        creds_info = st.secrets["gcp_service_account"]
+        credentials = service_account.Credentials.from_service_account_info(
+            creds_info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+        )
+        service = build('sheets', 'v4', credentials=credentials)
+        return service
+    except Exception as e:
+        st.error(f"Authentication Error: {e}")
+        return None
 
-# 3. BUILD THE UI
-st.title("🥔 Heritage Harvest Sales Portal")
-st.markdown("### Trade Spend & Margin Auditor")
-
-try:
-    df = get_data()
+# --- 2. DATA ACQUISITION ---
+def load_data():
+    service = get_gspread_client()
+    if not service: return pd.DataFrame()
     
-    # Sidebar for Inputs
-    st.sidebar.header("Negotiation Parameters")
-    selected_product = st.sidebar.selectbox("Select SKU", df['product_name'].tolist())
-    requested_discount = st.sidebar.slider("Requested Discount (%)", 0, 40, 15) / 100
-
-    # Pull data for the selected SKU
-    sku_info = df[df['product_name'] == selected_product].iloc[0]
+    # Replace with your actual Spreadsheet ID from your URL
+    SPREADSHEET_ID = '1X58_331T9eC3UAnD7G1_Gv707Pz778_vXz7pW56G6q0' 
+    RANGE_NAME = 'Sheet1!A:E' # Adjust to your sheet name/range
     
-    # Audit Logic
-    lp = float(sku_info['list_price'])
-    cogs = float(sku_info['cogs'])
-    net_price = lp * (1 - requested_discount)
-    margin = (net_price - cogs) / net_price
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME
+    ).execute()
     
-    # Validation
-    is_valid_discount = requested_discount <= float(sku_info['max_allowable_discount'])
-    is_valid_margin = margin >= float(sku_info['min_margin_threshold'])
+    values = result.get('values', [])
+    if not values:
+        return pd.DataFrame()
+    
+    return pd.DataFrame(values[1:], columns=values[0])
 
-    # Display Results
-    col1, col2, col3 = st.columns(3)
-    col1.metric("List Price", f"${lp:.2f}")
-    col2.metric("Net Price", f"${net_price:.2f}")
-    col3.metric("Projected Margin", f"{margin:.1%}")
+# --- 3. AUDIT LOGIC (Fuzzy Matching) ---
+df = load_data()
 
-    if is_valid_discount and is_valid_margin:
-        st.success(f"✅ **APPROVED:** This deal meets Heritage Harvest commercial guidelines.")
-        if st.button("Send Approval Email to Buyer"):
-            # We will link this to your send_summary_email function later
-            st.info("Emailing John Bridges...")
-    else:
-        st.error(f"❌ **DENIED:** This deal falls below margin thresholds.")
-        st.warning(f"Required Margin: {float(sku_info['min_margin_threshold']):.1%}")
+if not df.empty:
+    st.success("✅ Connected to Heritage Harvest Master Data")
+    
+    with st.sidebar:
+        st.header("Search & Audit")
+        user_input = st.text_input("Enter SKU Name or ID:")
+        threshold = st.slider("Matching Sensitivity", 60, 100, 85)
 
-    # Show the "Master Data" for this SKU for transparency
-    with st.expander("View SKU Technical Details"):
-        st.write(f"**UPC:** {sku_info['upc']}")
-        st.write(f"**SKU ID:** {sku_info['sku_id']}")
+    if user_input:
+        # Match user input against the 'SKU Name' column
+        choices = df['SKU Name'].tolist()
+        results = process.extract(user_input, choices, scorer=fuzz.WRatio, limit=5)
+        
+        matches = [res for res in results if res[1] >= threshold]
+        
+        if matches:
+            st.write(f"### Found {len(matches)} Potential Matches:")
+            for match_name, score, idx in matches:
+                item_data = df[df['SKU Name'] == match_name].iloc[0]
+                with st.expander(f"{match_name} (Match Score: {int(score)}%)"):
+                    st.write(f"**SKU ID:** {item_data.get('SKU ID', 'N/A')}")
+                    st.write(f"**UPC:** {item_data.get('UPC', 'N/A')}")
+                    st.write(f"**Standard Price:** ${item_data.get('Price', '0.00')}")
+        else:
+            st.warning("No matches found. Try lowering the sensitivity.")
+else:
+    st.info("Awaiting connection to Master Data...")
 
-except Exception as e:
-    st.error(f"Error connecting to Cloud Database: {e}")
+# --- Footer ---
+st.divider()
+st.caption("JBridges Consulting | Proprietary Commercial Audit Logic v1.0")
