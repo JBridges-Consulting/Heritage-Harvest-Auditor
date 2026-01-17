@@ -1,80 +1,123 @@
 import streamlit as st
 import pandas as pd
+import smtplib
+from email.message import EmailMessage
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from rapidfuzz import process, fuzz
 
-# --- JBridges Consulting | Brand Header ---
-st.set_page_config(page_title="Heritage Harvest | Audit Portal", page_icon="📊")
-st.title("JBridges Consulting | Heritage Harvest 📊")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Heritage Harvest | Audit Portal", page_icon="📊", layout="wide")
+st.title("Heritage Harvest 📊")
 st.markdown("### Automated Sales & Trade Audit Portal")
 
-# --- 1. SECURE AUTHENTICATION (The Cloud Bridge) ---
+# --- 1. HARDENED AUTH (FIXES SSL WRONG_VERSION_NUMBER) ---
 @st.cache_resource
 def get_gspread_client():
-    # Fetch credentials from Streamlit Cloud Secrets (NOT a local file)
     try:
         creds_info = st.secrets["gcp_service_account"]
         credentials = service_account.Credentials.from_service_account_info(
-            creds_info,
-            scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
+            creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
         )
-        service = build('sheets', 'v4', credentials=credentials)
-        return service
+        # Using discoveryServiceUrl forces a modern HTTPS endpoint to bypass local SSL decryption errors
+        return build('sheets', 'v4', credentials=credentials, 
+                     discoveryServiceUrl="https://sheets.googleapis.com/$discovery/rest?version=v4")
     except Exception as e:
         st.error(f"Authentication Error: {e}")
         return None
 
-# --- 2. DATA ACQUISITION ---
+# --- 2. EMAIL ENGINE (EXPLICIT SKU ID LABELS) ---
+def send_buyer_approval_email(approved_df, recipient_name, recipient_email):
+    sender_email = "jbconsultingdemo@gmail.com"
+    app_password = "hryfpqvirwvxjkhc" 
+    
+    msg = EmailMessage()
+    msg['Subject'] = "✔️ Approval: Heritage Harvest Items Cleared for Planning"
+    msg['From'] = f"Jenica Bridges <{sender_email}>"
+    msg['To'] = f"{recipient_name} <{recipient_email}>"
+
+    # BUILD ITEM LIST WITH PROFESSIONAL "SKU ID" LABEL
+    item_rows = [
+        f"- SKU ID: {row['sku_id']} | UPC: {row['upc']} | {row['product_name']}"
+        for _, row in approved_df.iterrows()
+    ]
+    
+    body = f"Hi {recipient_name},\n\nThe following Heritage Harvest items are approved for planning:\n\n{chr(10).join(item_rows)}\n\nBest Regards,\nJenica"
+    msg.set_content(body)
+    
+    try:
+        with smtplib.SMTP('smtp.gmail.com', 587) as smtp:
+            smtp.starttls()
+            smtp.login(sender_email, app_password)
+            smtp.send_message(msg)
+        return True
+    except Exception as e:
+        st.sidebar.error(f"Email failure: {e}")
+        return False
+
+# --- 3. LIVE DATA LOAD & MARGIN FIX ---
 def load_data():
     service = get_gspread_client()
     if not service: return pd.DataFrame()
-    
-    # Replace with your actual Spreadsheet ID from your URL
-    SPREADSHEET_ID = '1X58_331T9eC3UAnD7G1_Gv707Pz778_vXz7pW56G6q0' 
-    RANGE_NAME = 'Sheet1!A:E' # Adjust to your sheet name/range
-    
-    result = service.spreadsheets().values().get(
-        spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME
-    ).execute()
-    
-    values = result.get('values', [])
-    if not values:
+    SPREADSHEET_ID = '1aX-RfPcICG1H6llj9TeKJ9E3UeXnkOW02HARDnqUlvY'
+    try:
+        # Pulling fresh data from Google Sheets
+        result = service.spreadsheets().values().get(spreadsheetId=SPREADSHEET_ID, range='A:I').execute()
+        values = result.get('values', [])
+        if not values: return pd.DataFrame()
+        
+        df = pd.DataFrame(values[1:], columns=values[0])
+        df = df[df['product_name'].notna()]
+        
+        # Numeric conversion for Audit Math
+        for col in ['list_price', 'cogs', 'min_margin_threshold']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # MARGIN MATH + UNIFORM FORMAT (e.g. 59.2%)
+        df['Calculated_Margin'] = (df['list_price'] - df['cogs']) / df['list_price']
+        # Converting to string ensures Streamlit doesn't mess up formatting to 0.6%
+        df['Margin_Display'] = df['Calculated_Margin'].apply(lambda x: f"{x*100:.1f}%" if pd.notnull(x) else "0.0%")
+        
+        df['Audit_Status'] = df.apply(lambda r: "APPROVED" if r['Calculated_Margin'] >= r['min_margin_threshold'] else "REJECTED", axis=1)
+        return df
+    except Exception as e:
+        # Catching the SSL error here
+        st.error(f"Data Load Error: {e}")
         return pd.DataFrame()
-    
-    return pd.DataFrame(values[1:], columns=values[0])
 
-# --- 3. AUDIT LOGIC (Fuzzy Matching) ---
+# --- 4. INTERFACE ---
 df = load_data()
 
 if not df.empty:
-    st.success("✅ Connected to Heritage Harvest Master Data")
+    if st.sidebar.button("🔄 Sync with Google Sheets"):
+        st.rerun()
     
-    with st.sidebar:
-        st.header("Search & Audit")
-        user_input = st.text_input("Enter SKU Name or ID:")
-        threshold = st.slider("Matching Sensitivity", 60, 100, 85)
+    st.sidebar.header("Audit Controls")
+    product_list = sorted(df['product_name'].unique())
+    selected = st.sidebar.multiselect("Select Products:", options=["SELECT ALL"] + product_list, default=["SELECT ALL"])
+    display_df = df if "SELECT ALL" in selected else df[df['product_name'].isin(selected)]
 
-    if user_input:
-        # Match user input against the 'SKU Name' column
-        choices = df['SKU Name'].tolist()
-        results = process.extract(user_input, choices, scorer=fuzz.WRatio, limit=5)
-        
-        matches = [res for res in results if res[1] >= threshold]
-        
-        if matches:
-            st.write(f"### Found {len(matches)} Potential Matches:")
-            for match_name, score, idx in matches:
-                item_data = df[df['SKU Name'] == match_name].iloc[0]
-                with st.expander(f"{match_name} (Match Score: {int(score)}%)"):
-                    st.write(f"**SKU ID:** {item_data.get('SKU ID', 'N/A')}")
-                    st.write(f"**UPC:** {item_data.get('UPC', 'N/A')}")
-                    st.write(f"**Standard Price:** ${item_data.get('Price', '0.00')}")
-        else:
-            st.warning("No matches found. Try lowering the sensitivity.")
-else:
-    st.info("Awaiting connection to Master Data...")
+    recipient_name = st.sidebar.text_input("Buyer Name", value="Buyer Name")
+    recipient_email = st.sidebar.text_input("Buyer Email", value="buyer@heritageharvest.com")
+    
+    if st.sidebar.button("📧 Send Approval Email"):
+        approved_only = display_df[display_df['Audit_Status'] == "APPROVED"]
+        if not approved_only.empty:
+            if send_buyer_approval_email(approved_only, recipient_name, recipient_email):
+                st.sidebar.success(f"Sent to {recipient_name}!")
 
-# --- Footer ---
-st.divider()
-st.caption("JBridges Consulting | Proprietary Commercial Audit Logic v1.0")
+    # Restored Download Button
+    excel_data = display_df[['sku_id', 'upc', 'product_name', 'Audit_Status']].to_csv(index=False).encode('utf-8-sig')
+    st.sidebar.download_button(label="📥 Download Excel Audit", data=excel_data, file_name=f"Audit.csv")
+
+    # Main Dashboard Table
+    st.success("✅ Audit Logic Active")
+    st.dataframe(
+        display_df[['Audit_Status', 'sku_id', 'upc', 'product_name', 'list_price', 'Margin_Display']], 
+        use_container_width=True, hide_index=True,
+        column_config={
+            "sku_id": "SKU ID",
+            "upc": "UPC",
+            "list_price": st.column_config.NumberColumn("Price", format="$%.2f"),
+            "Margin_Display": "Calculated Margin"
+        }
+    )
